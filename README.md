@@ -4,7 +4,7 @@
 并附带 **SQLite 持久化的会议预约接口**（幂等创建、乐观锁版本改期、
 软删除取消、**两条预约时段原子交换**、单事务冲突检测、
 **可校验的 SHA-256 哈希链变更历史**、
-**预约临时保留 / 确认**、**预约候补队列**）。
+**预约临时保留 / 确认**、**预约候补队列**、**预约时序依赖**）。
 
 每位参与者按**本地星期与钟面时刻**填写每周重复的可用区间并给出 IANA 时区
 （如 `Asia/Shanghai`），服务按具体日期应用夏令时（DST）规则，统一换算到 UTC，
@@ -37,11 +37,12 @@ app/
   reservations.py  # 预约核心：规范化、幂等创建、乐观锁版本改期/取消、时段原子交换、单事务冲突检测、历史读取、取消后 FIFO 候补晋升
   holds.py         # 临时保留核心：TTL 占位、事务内惰性过期、确认转正式预约
   waitlist.py      # 候补核心：可预约直订/否则入队、request_id 幂等、取消事务内 FIFO 扫描晋升
+  dependencies.py  # 时序依赖核心：predecessor.end+gap<=successor.start 有向约束、自环/环拒绝、改期/取消/交换同事务可达重校验
   audit.py         # 审计事件：canonical JSON、SHA-256 哈希链追加与整链重验
   db.py            # SQLite 连接管理、建表与无损迁移（补列 / 补 baseline 事件）
   schemas.py       # Pydantic 请求/响应模型
   main.py          # FastAPI 路由
-tests/             # pytest 测试（DST、跨午夜、排序、预约冲突/幂等/并发、时段交换、临时保留、候补 FIFO 晋升、哈希链/篡改/迁移）
+tests/             # pytest 测试（DST、跨午夜、排序、预约冲突/幂等/并发、时段交换、临时保留、候补 FIFO 晋升、时序依赖自环/环/重校验、哈希链/篡改/迁移）
 Dockerfile
 docker-compose.yml
 requirements.txt  # 运行依赖
@@ -80,6 +81,9 @@ docker compose up --build
 升级到带**候补队列**的版本后，`reservation_waitlist` 与
 `reservation_waitlist_participants` 两张新表同样以
 `CREATE TABLE IF NOT EXISTS` 幂等无损建立，不影响任何既有数据。
+升级到带**时序依赖**的版本后，`reservation_dependencies` 表以
+`CREATE TABLE IF NOT EXISTS` 幂等无损建立（含幂等请求 ID 唯一约束与
+前驱/后继索引），不改动任何既有预约、事件、保留与候补数据。
 
 服务启动后访问 <http://localhost:8000>（Swagger UI 在 <http://localhost:8000/docs>）。
 若 8000 端口被占用：
@@ -287,6 +291,10 @@ curl -s -X POST http://localhost:8000/api/v1/reservations \
   及冲突明细。
 - 成功时 `request_id` 与 `created_at` 不变，`version` 加 `1`，返回更新后的预约
   （结构同创建响应）。
+- **时序依赖**：同事务以改期后的新时刻重校验与本预约可达的全部
+  `predecessor.end + gap <= successor.start` 约束；任一违反 → `409`
+  并在 `violations` 中列出从本预约出发的完整链路（见
+  [预约时序依赖](#post-apiv1reservation-dependencies)），整体回滚。
 - **审计**：成功改期在同一事务追加 `rescheduled` 事件（快照为改期后的新状态）；
   任一步失败或并发落败都不产生事件。
 
@@ -363,6 +371,9 @@ curl -s -X PUT http://localhost:8000/api/v1/reservations/1 \
 - **幂等重试**：相同 `reservation_id` + 原 `expected_version` 重试 → `200`
   返回**同一取消结果**（同样的 `canceled_at` 与版本），不重复变更；
   取消后使用其他版本号 → `409` + `current_version`。
+- **时序依赖**：同事务以取消后的状态重校验可达依赖（端点已取消的边休眠，
+  其余活动边仍须满足），违反 → `409` + `violations` 且连同取消本身整体回滚、
+  不发生候补晋升（见 [预约时序依赖](#post-apiv1reservation-dependencies)）。
 - 取消是**终态**：之后 `PUT` 改期一律 `409`，预约不会复活；
   创建请求的迟到重试（同 `request_id` + 同内容）幂等返回该已取消记录。
 - **审计**：成功取消在同一事务追加 `canceled` 事件（快照记录取消终态）；
@@ -431,6 +442,8 @@ curl -s -X DELETE 'http://localhost:8000/api/v1/reservations/1?expected_version=
   （双方交换前均为 active，共享参与者的占用集合交换后不变）。
 - 成功 → `200`：两条预约的 `start_utc` / `end_utc` 互换，`version`
   **各加 1**，返回双方交换后的最新状态。
+- **时序依赖**：同一事务以交换后双方各自的新时段重校验与之可达的全部
+  时序依赖；任一违反 → `409` + `violations`（完整链路），整体回滚。
 - **审计**：成功交换在同一事务为**双方各追加一条 `rescheduled` 哈希链事件**
   （快照为各自交换后的新状态）；任一步失败不产生事件。
 
@@ -758,6 +771,129 @@ curl -s http://localhost:8000/api/v1/reservation-waitlist/req-wait-2
 6. 候补只在**取消**时触发晋升（改期不触发）；晋升后的预约与普通创建完全等价
    （可验链、改期、再次取消——再次取消时同样会尝试晋升后续候补）。
 
+### `POST /api/v1/reservation-dependencies`
+
+建立**预约时序依赖**：在两条预约之间建立有向的最小间隔约束
+
+```
+predecessor.end + minimum_gap_minutes <= successor.start
+```
+
+请求体：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `dependency_request_id` | 非空字符串（≤200） | 客户端幂等请求标识 |
+| `predecessor_id` | 正整数 | 前驱预约 ID（先结束的预约） |
+| `successor_id` | 正整数 | 后继预约 ID（后开始的预约）；**必须与前驱不同** |
+| `minimum_gap_minutes` | 非负整数 | 最小间隔分钟数；`0` 表示首尾相接即可 |
+
+语义（整个自环/存在性/幂等/环检测/写入在单个 `BEGIN IMMEDIATE` 事务内完成）：
+
+- **自环拒绝**：`predecessor_id == successor_id` → `422`；
+- 前驱或后继预约不存在 → `404`（响应给出 `role`：`predecessor` / `successor`）；
+- **幂等**：相同 `dependency_request_id` + 相同规范化内容
+  （`predecessor_id`、`successor_id`、`minimum_gap_minutes`）重放
+  → `200` 返回原依赖，不新增记录；同一 `dependency_request_id` 内容不同
+  → `409`（`existing_dependency_id`）；
+- 同一对预约之间至多一条约束：相同最小间隔的重复建立按幂等重放返回原依赖，
+  不同最小间隔 → `409`；
+- **环拒绝**：依赖图必须始终是 DAG。新增 `predecessor -> successor` 前沿
+  successor 方向 BFS，若 successor 已能到达 predecessor（加入即成环）
+  → `409`，响应 `path` 给出已存在的 `successor -> ... -> predecessor`
+  有向路径，`cycle` 给出闭合链路（首尾节点重复，如 `[3, 1, 2, 3]`）；
+  失败整体回滚，不写入约束；
+- 建立时**不**校验当前排班是否已满足间隔——约束建立后由改期/取消/交换
+  路径负责维护；依赖本身不产生哈希链审计事件。
+
+请求示例（预约 #1 结束后至少 30 分钟，预约 #2 才能开始）：
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/reservation-dependencies \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "dependency_request_id": "dep-a1b2",
+    "predecessor_id": 1,
+    "successor_id": 2,
+    "minimum_gap_minutes": 30
+  }'
+```
+
+成功响应（`201`，幂等重放为 `200`）：
+
+```json
+{
+  "dependency_id": 1,
+  "dependency_request_id": "dep-a1b2",
+  "predecessor_id": 1,
+  "successor_id": 2,
+  "minimum_gap_minutes": 30,
+  "created_at": "2026-09-19T03:10:00.123456Z"
+}
+```
+
+成环时（`409`，已有 `#3 -> #1 -> #2` 路径，再建 `#2 -> #3` 闭合）：
+
+```json
+{
+  "detail": "reservation dependency would create a directed cycle: 3 -> 1 -> 2 -> 3",
+  "path": [3, 1, 2],
+  "cycle": [3, 1, 2, 3]
+}
+```
+
+同 `dependency_request_id` 内容不同（`409`）：
+
+```json
+{
+  "detail": "reservation dependency #1 with different content",
+  "existing_dependency_id": 1
+}
+```
+
+其他错误：`422`（自环、`minimum_gap_minutes < 0`、ID 为空等）。
+
+**改期 / 取消 / 交换时的依赖重校验**：
+
+- `PUT /api/v1/reservations/{id}` 改期、`DELETE .../{id}` 取消与
+  `POST /reservations/swap` 时段交换，都会在其**同一个
+  `BEGIN IMMEDIATE` 事务**内、以**待写入的新时刻**重新校验与被变更预约
+  **可达**（忽略方向、逐边相连）的全部依赖；
+- 一端已取消的边**休眠**：取消是终态，休眠边不参与校验（但仍参与环检测，
+  依赖图无环性永远成立）；
+- 任一 active 边违反 `predecessor.end + gap <= successor.start`
+  → **`409`**：事务整体回滚，**不写入任何部分变更**（版本不推进、占用不移动、
+  审计事件不追加、候补晋升不发生）。响应 `violations` 逐条给出被违反的
+  依赖（双方预约 ID、要求/实际间隔）与**从被变更预约出发的完整链路**
+  （链上各节点的 ID、重校验时刻与状态）；
+- 成功时**沿用现有版本与审计事件**：改期/交换 `version` 加 1 并追加
+  `rescheduled` 事件，取消置 `canceled`、`version` 加 1 并追加 `canceled`
+  事件——依赖重校验不新增事件类型；
+- 创建新预约、保留确认与候补晋升不引用既有依赖，无需重校验。
+
+改期违反约束时（`409`，`actual_gap_minutes` 为实际间隔，负数表示已重叠）：
+
+```json
+{
+  "detail": "reservation dependency violated: reservation #1 must end at least 30 minute(s) before reservation #2 starts",
+  "violations": [
+    {
+      "dependency_id": 1,
+      "predecessor_id": 1,
+      "successor_id": 2,
+      "minimum_gap_minutes": 30,
+      "actual_gap_minutes": 15.0,
+      "chain": [
+        {"reservation_id": 1, "start_utc": "2026-03-09T10:00:00Z",
+         "end_utc": "2026-03-09T11:00:00Z", "status": "active"},
+        {"reservation_id": 2, "start_utc": "2026-03-09T11:15:00Z",
+         "end_utc": "2026-03-09T11:45:00Z", "status": "active"}
+      ]
+    }
+  ]
+}
+```
+
 ### `GET /api/v1/reservations/{reservation_id}/history`
 
 返回预约的**可校验变更历史**：按序（`seq` 升序）列出审计事件，服务端在返回前
@@ -911,6 +1047,17 @@ for ev in history["events"]:
   晋升）、晋升产生的预约可正常验链/改期/再取消；跨端点 `request_id` 一致
   （直接预约/保留确认与候补互相识别同内容幂等、异内容 409）；并发入队与
   并发取消下恰好一个赢家；旧版库初始化无损新建候补表、迁移幂等。
+- **时序依赖（dependencies）**：建立 201 并持久化约束、`gap=0` 首尾相接
+  合法、自环 422、端点不存在 404（区分前驱/后继）、两元环与多跳环均 409
+  并返回 `path`/闭合 `cycle`、失败不写约束；同 `dependency_request_id`
+  同内容重放 200、异内容 409、同对同间隔异请求 ID 幂等、同对异间隔 409；
+  改期后继过早 / 前驱过晚 409（含要求与实际间隔、完整链路、待写入时刻）、
+  等号边界与 `gap=0` 相邻允许、不可达依赖不误伤、前驱链路可达边一并重校验、
+  失败整体回滚（版本/占用/审计均不变）、成功改期沿用版本递增与
+  `rescheduled` 事件且哈希链可重验；取消后休眠边不再约束、取消中间节点后
+  其余活动边继续生效；交换违反 409 且双方回滚、满足则双方版本各 +1；
+  并发成环尝试恰一个赢家、并发同 ID 重放仅一行、并发改期下违反者必败
+  且最终时段满足约束；旧版库初始化无损新建依赖表、迁移幂等。
 
 ```bash
 pytest -q

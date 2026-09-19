@@ -18,6 +18,10 @@
   成功后双方 ``version`` 各加 1。
 - 每次**成功**的创建/改期/取消/交换都在同一事务内向 ``reservation_events``
   追加哈希链审计事件（:mod:`app.audit`）；失败请求与幂等重放不产生事件。
+- **时序依赖**（:mod:`app.dependencies`）：改期/取消/交换在其同一个
+  ``BEGIN IMMEDIATE`` 事务内以待写入状态重校验与被变更预约可达的全部
+  ``predecessor.end + gap <= successor.start`` 约束；任一违反即整体回滚
+  （409 + 完整链路），成功时沿用上述版本递增与审计事件。
 """
 
 from __future__ import annotations
@@ -424,6 +428,19 @@ def reschedule_reservation(
             if conflicts:
                 raise ReservationConflictError(conflicts)
 
+            # 时序依赖重校验：在同一写事务内以待写入状态检查从本预约
+            # （忽略方向）可达的全部依赖；任一违反整体回滚（409 + 完整链路）。
+            from . import dependencies as dep_core
+            dep_core.evaluate_reachable(
+                conn,
+                roots=(reservation_id,),
+                overrides={reservation_id: {
+                    "start_utc": start_s,
+                    "end_utc": end_s,
+                    "status": "active",
+                }},
+            )
+
             conn.execute(
                 "UPDATE reservations"
                 " SET start_utc = ?, end_utc = ?, participants_key = ?,"
@@ -572,6 +589,26 @@ def swap_reservations(
                 conn, participants_b, new_b_start_s, new_b_end_s, now_s))
             if conflicts:
                 raise ReservationConflictError(conflicts)
+
+            # 时序依赖重校验：交换同时移动双方，在同一写事务内以待写入的
+            # 两个新时段重校验与双方可达的全部依赖；任一违反整体回滚。
+            from . import dependencies as dep_core
+            dep_core.evaluate_reachable(
+                conn,
+                roots=(first_id, second_id),
+                overrides={
+                    first_id: {
+                        "start_utc": new_a_start_s,
+                        "end_utc": new_a_end_s,
+                        "status": "active",
+                    },
+                    second_id: {
+                        "start_utc": new_b_start_s,
+                        "end_utc": new_b_end_s,
+                        "status": "active",
+                    },
+                },
+            )
 
             # 主表行：仅互换起止时刻并各推进版本；
             # request_id / participants_key / created_at 保持不变。
@@ -748,6 +785,20 @@ def cancel_reservation(
                 action="canceled",
                 timestamp=now_s,
                 snapshot=snapshot,
+            )
+            # 时序依赖重校验：在同一写事务内以待写入的 canceled 状态
+            # 重校验从本预约可达的全部依赖（休眠边跳过；活动边仍须满足）。
+            # 校验须在候补晋升之前：失败时连同取消本身整体回滚，
+            # 不会留下“已晋升但取消被拒”的部分变更。
+            from . import dependencies as dep_core
+            dep_core.evaluate_reachable(
+                conn,
+                roots=(reservation_id,),
+                overrides={reservation_id: {
+                    "start_utc": row["start_utc"],
+                    "end_utc": row["end_utc"],
+                    "status": "canceled",
+                }},
             )
             # 取消与释放占用已在本事务完成（占用行已删除，其他事务在本事务
             # 提交前无法看到中间状态）：同事务按 FIFO 扫描受影响候补，

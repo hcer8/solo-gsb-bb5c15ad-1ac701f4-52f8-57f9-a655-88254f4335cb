@@ -13,6 +13,7 @@ from fastapi import FastAPI, Query, Response
 from fastapi.responses import JSONResponse
 
 from . import db as db_module
+from . import dependencies as dependency_core
 from . import holds as hold_core
 from . import reservations as reservation_core
 from . import scheduling
@@ -26,6 +27,14 @@ from .holds import (
 from .waitlist import (
     WaitlistContentConflictError,
     WaitlistNotFoundError,
+)
+from .dependencies import (
+    DependencyCycleError,
+    DependencyEndpointNotFoundError,
+    DependencyPairConflictError,
+    DependencyRequestConflictError,
+    DependencySelfLoopError,
+    DependencyViolationError,
 )
 from .reservations import (
     RequestIdConflictError,
@@ -41,6 +50,8 @@ from .schemas import (
     HistoryEventOut,
     LocalTimeOut,
     ParticipantIn,
+    ReservationDependencyIn,
+    ReservationDependencyOut,
     ReservationHistoryOut,
     ReservationHoldConfirmIn,
     ReservationHoldIn,
@@ -86,8 +97,15 @@ app = FastAPI(
         "正式预约，否则按创建时间进入 pending 队列（相同 request_id 幂等）；"
         "取消正式预约时在同一 BEGIN IMMEDIATE 事务内按 FIFO 扫描受影响候补，"
         "跳过仍冲突项，把首个可满足项原子转为正式预约并写入现有哈希链审计。"
+        "还提供预约时序依赖（reservation dependency）：在两条预约之间建立"
+        "predecessor.end + gap <= successor.start 的有向最小间隔约束，"
+        "拒绝自环及会形成有向环的新增链路（409 并给出闭合链路），"
+        "相同 dependency_request_id 与规范化内容重放返回原依赖；"
+        "改期/取消（及时段交换）在同一 BEGIN IMMEDIATE 事务内重新校验"
+        "其全部可达依赖，违反约束返回 409 并列出完整链路，"
+        "不写入任何部分变更，成功时沿用现有版本递增与哈希链审计事件。"
     ),
-    version="1.7.0",
+    version="1.8.0",
     lifespan=lifespan,
 )
 
@@ -188,6 +206,95 @@ async def chain_verification_error_handler(
         status_code=409,
         content={"detail": f"reservation history chain verification failed: {exc}"},
     )
+
+
+# --------------------------------------------- reservation dependency errors
+
+
+@app.exception_handler(DependencyEndpointNotFoundError)
+async def dependency_endpoint_not_found_handler(
+    request, exc: DependencyEndpointNotFoundError
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=404,
+        content={
+            "detail": str(exc),
+            "role": exc.role,
+            "reservation_id": exc.reservation_id,
+        },
+    )
+
+
+@app.exception_handler(DependencyCycleError)
+async def dependency_cycle_handler(
+    request, exc: DependencyCycleError
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=409,
+        content={"detail": str(exc), **exc.payload},
+    )
+
+
+@app.exception_handler(DependencyRequestConflictError)
+async def dependency_request_conflict_handler(
+    request, exc: DependencyRequestConflictError
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=409,
+        content={
+            "detail": str(exc),
+            "existing_dependency_id": exc.dependency_id,
+        },
+    )
+
+
+@app.exception_handler(DependencyPairConflictError)
+async def dependency_pair_conflict_handler(
+    request, exc: DependencyPairConflictError
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=409,
+        content={
+            "detail": str(exc),
+            "existing_dependency_id": exc.dependency_id,
+        },
+    )
+
+
+@app.exception_handler(DependencyViolationError)
+async def dependency_violation_handler(
+    request, exc: DependencyViolationError
+) -> JSONResponse:
+    # 核心层链路节点使用定宽 UTC 文本（如 ...000000Z）；在 API 边界统一
+    # 规范化为与其他接口一致的 ISO 8601 带 Z 形式
+    def _normalize(value: object) -> object:
+        if isinstance(value, str):
+            try:
+                return _iso_z(datetime.strptime(value, _AUDIT_CANON_FMT)
+                              .replace(tzinfo=timezone.utc))
+            except ValueError:
+                return value
+        if isinstance(value, dict):
+            return {k: _normalize(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [_normalize(v) for v in value]
+        return value
+
+    return JSONResponse(
+        status_code=409,
+        content={
+            "detail": str(exc),
+            "violations": _normalize(exc.violations),
+        },
+    )
+
+
+@app.exception_handler(DependencySelfLoopError)
+async def dependency_self_loop_handler(
+    request, exc: DependencySelfLoopError
+) -> JSONResponse:
+    # API 层 schema 已以 422 拦截自环；核心层防御路径同样返回 422
+    return JSONResponse(status_code=422, content={"detail": str(exc)})
 
 
 @app.get("/health")
@@ -332,6 +439,9 @@ def reschedule_reservation(
     - 预约已取消 → 409（取消是终态，改期不会使其复活）；
     - ``expected_version`` 与当前版本不一致 → 409，响应给出 ``current_version``；
     - 任一新参与者与**其他**预约半开区间重叠（自动排除自身）→ 409 + 冲突明细；
+    - 与本预约**可达**的时序依赖（predecessor.end + gap <= successor.start）
+      在同一事务以改期后的新时刻重校验，任一违反 → 409 + ``violations``
+      （含从本预约出发的完整链路）；
     - 成功 → 原子替换时间与参与者占用，``version`` 加 1，返回更新后的预约。
 
     所有检查与写入在单个 ``BEGIN IMMEDIATE`` 事务内完成；任一步失败，
@@ -361,7 +471,8 @@ def cancel_reservation(
     - ``expected_version`` 与当前版本不一致 → 409，响应给出 ``current_version``；
     - 成功 → 单个 ``BEGIN IMMEDIATE`` 事务内把预约置为 ``canceled``、记录
       ``canceled_at``、``version`` 加 1，并删除全部参与者占用，
-      时段提交后立即可再次预约；
+      时段提交后立即可再次预约；同事务以取消后的状态重校验可达的时序
+      依赖（端点已取消的边休眠，其余活动边仍须满足），随后才尝试候补晋升；
     - 相同 ``reservation_id`` + 原 ``expected_version`` 的重试 → 幂等返回
       同一取消结果（同样的 ``canceled_at`` 与版本），不重复变更；
     - 取消是终态：之后 PUT 改期一律 409，不会复活。
@@ -387,6 +498,8 @@ def swap_reservation_windows(req: ReservationSwapIn) -> ReservationSwapOut:
     - 成功 → 200：两条预约的 ``start_utc``/``end_utc`` 互换，
       ``version`` 各加 1，``request_id``、参与者与 ``created_at`` 不变；
       同一事务内为双方各追加一条 ``rescheduled`` 哈希链审计事件。
+    - 交换在同一事务以待写入的两个新时段重校验与双方**可达**的全部
+      预约时序依赖，任一约束被违反 → 409 + ``violations``（完整链路）。
 
     所有检查与写入在单个 ``BEGIN IMMEDIATE`` 事务内完成；任一步失败
     整体回滚，两条预约及其参与者占用、审计链均保持原状。
@@ -437,6 +550,65 @@ def get_reservation_history(reservation_id: int) -> ReservationHistoryOut:
             for e in events
         ],
     )
+
+
+# ---------------------------------------------------- reservation dependency
+
+
+def _dependency_to_out(
+    d: dependency_core.ReservationDependency,
+) -> ReservationDependencyOut:
+    return ReservationDependencyOut(
+        dependency_id=d.id,
+        dependency_request_id=d.dependency_request_id,
+        predecessor_id=d.predecessor_id,
+        successor_id=d.successor_id,
+        minimum_gap_minutes=d.minimum_gap_minutes,
+        created_at=_iso_z(d.created_at),
+    )
+
+
+@app.post(
+    "/api/v1/reservation-dependencies",
+    response_model=ReservationDependencyOut,
+    status_code=201,
+)
+def create_reservation_dependency(
+    req: ReservationDependencyIn, response: Response
+) -> ReservationDependencyOut:
+    """建立预约时序依赖：``predecessor.end + gap <= successor.start``。
+
+    在单个 ``BEGIN IMMEDIATE`` 事务内完成自环/幂等/存在性/环检测与写入：
+
+    - ``predecessor_id == successor_id``（自环）→ ``422``（schema 层拦截）；
+    - 前驱或后继预约不存在 → ``404``（响应给出 ``role`` 与 ``reservation_id``）；
+    - 相同 ``dependency_request_id`` + 相同规范化内容
+      （predecessor_id、successor_id、minimum_gap_minutes）重放
+      → ``200`` 返回原依赖，不新增记录；同 ``dependency_request_id``
+      内容不同 → ``409``（``existing_dependency_id``）；
+    - 同一对预约之间已存在约束：相同最小间隔按幂等重放返回原依赖，
+      不同最小间隔 → ``409``；
+    - 新增边会使依赖图成环（沿 successor 方向 successor 已可到达
+      predecessor）→ ``409``，响应 ``cycle`` 给出闭合链路、``path``
+      给出已存在的 successor → predecessor 有向路径；
+    - 成功 → ``201``：建立有向约束 ``predecessor.end + minimum_gap_minutes
+      <= successor.start``。依赖不产生哈希链审计事件。
+
+    建立后，改期 / 取消 / 时段交换预约时，系统会在**同一写事务**内
+    重新校验其全部可达依赖：违反约束 → ``409`` + ``violations``
+    （含完整链路），整体回滚、不写入部分变更；成功则沿用现有版本递增
+    与 ``rescheduled`` / ``canceled`` 哈希链审计事件。
+    """
+    dependency, created = dependency_core.create_dependency(
+        dependency_request_id=req.dependency_request_id,
+        predecessor_id=req.predecessor_id,
+        successor_id=req.successor_id,
+        minimum_gap_minutes=req.minimum_gap_minutes,
+    )
+    if not created:
+        # 幂等重放：返回原依赖
+        response.status_code = 200
+    return _dependency_to_out(dependency)
 
 
 # --------------------------------------------------------- reservation holds

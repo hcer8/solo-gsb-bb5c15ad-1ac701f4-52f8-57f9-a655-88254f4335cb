@@ -166,6 +166,88 @@ class ReservationRescheduleIn(_ReservationWindowBase):
     )
 
 
+class ReservationDependencyIn(BaseModel):
+    """预约时序依赖创建请求：predecessor.end + minimum_gap_minutes <= successor.start。"""
+
+    dependency_request_id: str = Field(
+        min_length=1, max_length=200,
+        description=(
+            "客户端幂等请求标识：相同标识 + 相同规范化内容"
+            "（predecessor_id、successor_id、minimum_gap_minutes）重放"
+            "返回原依赖；同标识内容不同返回 409"
+        ),
+        examples=["dep-a1b2"],
+    )
+    predecessor_id: int = Field(
+        ge=1,
+        description="前驱预约 ID（先结束的预约）",
+        examples=[1],
+    )
+    successor_id: int = Field(
+        ge=1,
+        description="后继预约 ID（后开始的预约）；必须与前驱不同",
+        examples=[2],
+    )
+    minimum_gap_minutes: int = Field(
+        ge=0,
+        description=(
+            "前驱结束与后继开始之间的最小间隔分钟数（非负，0 表示首尾相接即可）"
+        ),
+        examples=[30],
+    )
+
+    @model_validator(mode="after")
+    def _validate_distinct(self) -> "ReservationDependencyIn":
+        if self.predecessor_id == self.successor_id:
+            raise ValueError(
+                "predecessor_id and successor_id must be different (no self-loop)"
+            )
+        return self
+
+
+class ReservationDependencyChainNodeOut(BaseModel):
+    """时序约束违规链路中的一个预约节点（含重校验时使用的时刻）。"""
+
+    reservation_id: int
+    start_utc: str | None = Field(
+        default=None,
+        description="重校验时刻该预约的 UTC 开始时间（ISO 8601 定宽文本）",
+    )
+    end_utc: str | None = Field(
+        default=None,
+        description="重校验时刻该预约的 UTC 结束时间（ISO 8601 定宽文本）",
+    )
+    status: str | None = Field(default=None, description="active / canceled")
+
+
+class ReservationDependencyViolationOut(BaseModel):
+    """单条被违反的时序依赖及从被变更预约出发的完整链路。"""
+
+    dependency_id: int
+    predecessor_id: int = Field(description="前驱预约 ID")
+    successor_id: int = Field(description="后继预约 ID")
+    minimum_gap_minutes: int = Field(description="要求的最小间隔（分钟）")
+    actual_gap_minutes: float = Field(
+        description="重校验时实际的间隔分钟数（负数表示已经重叠）",
+    )
+    chain: list[ReservationDependencyChainNodeOut] = Field(
+        description=(
+            "从被变更预约出发、沿 successor 方向包含被违反边的完整预约链路"
+        ),
+    )
+
+
+class ReservationDependencyOut(BaseModel):
+    """预约时序依赖。"""
+
+    dependency_id: int
+    dependency_request_id: str
+    predecessor_id: int
+    successor_id: int
+    minimum_gap_minutes: int = Field(description="最小间隔分钟数（非负）")
+    created_at: str = Field(description="建立时间（UTC ISO 8601）")
+
+
 class ReservationSwapLegIn(BaseModel):
     """时段交换的一条腿：预约 ID + 客户端所持乐观锁版本。"""
 
