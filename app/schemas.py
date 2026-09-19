@@ -243,6 +243,52 @@ class ReservationWaitlistIn(_ReservationWindowBase):
     )
 
 
+class ReservationDependencyIn(BaseModel):
+    """预约时序依赖创建请求：有向最小间隔约束 + 客户端幂等键。"""
+
+    dependency_request_id: str = Field(
+        min_length=1, max_length=200,
+        description=(
+            "客户端幂等请求标识：相同标识 + 相同规范化内容（前驱、后继、"
+            "间隔分钟）重试返回原依赖；标识相同但内容不同返回 409"
+        ),
+        examples=["dep-3fa1"],
+    )
+    predecessor_id: int = Field(
+        ge=1,
+        description="前驱预约 ID：必须先结束",
+        examples=[1],
+    )
+    successor_id: int = Field(
+        ge=1,
+        description="后继预约 ID：开始时刻须不早于 前驱结束时刻 + 最小间隔",
+        examples=[2],
+    )
+    min_gap_minutes: int = Field(
+        ge=0,
+        description=(
+            "最小间隔（分钟）：successor.start >= predecessor.end + 间隔；"
+            "0 表示首尾相接即可"
+        ),
+        examples=[30],
+    )
+
+    @model_validator(mode="after")
+    def _validate_distinct(self) -> "ReservationDependencyIn":
+        if self.predecessor_id == self.successor_id:
+            raise ValueError("predecessor_id and successor_id must be different")
+        return self
+
+
+class ReservationDependencyOut(BaseModel):
+    dependency_id: int
+    dependency_request_id: str
+    predecessor_id: int
+    successor_id: int
+    min_gap_minutes: int
+    created_at: str
+
+
 class ReservationHoldOut(BaseModel):
     hold_id: int
     hold_key: str

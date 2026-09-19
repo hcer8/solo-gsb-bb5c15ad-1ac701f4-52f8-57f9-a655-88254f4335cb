@@ -18,6 +18,9 @@
   成功后双方 ``version`` 各加 1。
 - 每次**成功**的创建/改期/取消/交换都在同一事务内向 ``reservation_events``
   追加哈希链审计事件（:mod:`app.audit`）；失败请求与幂等重放不产生事件。
+- 改期与取消还会在同一事务内重验该预约的**全部可达时序依赖**
+  （:mod:`app.dependencies`：``predecessor.end + gap <= successor.start``）：
+  任一约束不满足则整体回滚并返回 409 + 完整链路，不写入部分变更。
 """
 
 from __future__ import annotations
@@ -379,6 +382,10 @@ def reschedule_reservation(
     4. 半开区间冲突检查：沿用创建时的重叠判定，但通过
        ``reservation_id != ?`` **排除自身**（自身旧占用不算冲突）；
        有冲突 → :class:`ReservationConflictError`（409 + 冲突明细）。
+    5. 时序依赖重验：新时段下该预约的**全部可达依赖**
+       （``predecessor.end + gap <= successor.start``）必须全部满足，
+       否则 → :class:`dependencies.DependencyViolationError`
+       （409 + 完整链路）；此时尚未写入任何变更。
 
     成功时更新 ``reservations`` 行（时间、规范化参与者、version+1）并整体
     替换 ``reservation_participants`` 占用；``request_id`` 与 ``created_at``
@@ -423,6 +430,13 @@ def reschedule_reservation(
                 conn, participants, start_s, end_s, now_s))
             if conflicts:
                 raise ReservationConflictError(conflicts)
+
+            # 时序依赖重验：新时段下该预约的全部可达依赖必须仍然满足，
+            # 否则 409 并整体回滚（此时尚未写入任何变更）。
+            # 惰性导入避免与 dependencies 模块循环导入。
+            from . import dependencies as dependency_core
+            dependency_core.validate_reachable_dependencies(
+                conn, reservation_id, new_start_s=start_s, new_end_s=end_s)
 
             conn.execute(
                 "UPDATE reservations"
@@ -672,11 +686,14 @@ def cancel_reservation(
 
     3. 进行中但 ``expected_version`` 与当前版本不一致
        → :class:`VersionConflictError`（409 + ``current_version``）；
-    4. 否则执行取消：``status`` 置为 ``canceled``、记录 ``canceled_at``、
+    4. 时序依赖重验：该预约的**全部可达依赖**在当前（取消不改变起止时刻）
+       必须全部满足，否则 → :class:`dependencies.DependencyViolationError`
+       （409 + 完整链路），整体回滚；
+    5. 否则执行取消：``status`` 置为 ``canceled``、记录 ``canceled_at``、
        ``version`` 加 1，并**删除全部参与者占用行**——时段在同一事务
        提交后立即可被他人预约；预约行本身保留（软删除），此后改期
        请求一律 409，不会复活。
-    5. 释放占用后，在**同一事务**内按 FIFO 扫描受释放时段影响的候补队列
+    6. 释放占用后，在**同一事务**内按 FIFO 扫描受释放时段影响的候补队列
        （``reservation_waitlist``）：跳过仍与其他进行中预约或未过期保留
        冲突的候选项，把首个可满足项原子转为正式预约（复用正式预约写入，
        并追加现有 ``created`` 哈希链审计事件）。无可满足候补则不晋升。
@@ -712,6 +729,13 @@ def cancel_reservation(
 
             if expected_version != current_version:
                 raise VersionConflictError(reservation_id, current_version)
+
+            # 时序依赖重验：取消不改变起止时刻，但该预约的全部可达依赖
+            # 在当前状态下必须仍然满足，否则 409 并整体回滚
+            # （此时尚未写入任何变更）。惰性导入避免循环导入。
+            from . import dependencies as dependency_core
+            dependency_core.validate_reachable_dependencies(
+                conn, reservation_id)
 
             canceled_participants = tuple(
                 json.loads(row["participants_key"]))

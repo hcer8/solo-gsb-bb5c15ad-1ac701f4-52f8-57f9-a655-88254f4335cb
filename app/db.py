@@ -98,6 +98,19 @@ CREATE TABLE IF NOT EXISTS reservation_waitlist_participants (
 -- 候补不占位，故不参与任何冲突检查。
 CREATE INDEX IF NOT EXISTS idx_wp_participant_window
     ON reservation_waitlist_participants (participant_id, start_utc, end_utc);
+CREATE TABLE IF NOT EXISTS reservation_dependencies (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    dependency_request_id TEXT NOT NULL UNIQUE,  -- 客户端幂等请求标识（独立命名空间）
+    predecessor_id        INTEGER NOT NULL REFERENCES reservations(id),  -- 前驱：必须先结束
+    successor_id          INTEGER NOT NULL REFERENCES reservations(id),  -- 后继：必须足够晚开始
+    min_gap_minutes       INTEGER NOT NULL,  -- 最小间隔（分钟）：successor.start >= predecessor.end + gap
+    created_at            TEXT NOT NULL
+);
+-- 改期/取消重验时按端点双向遍历依赖图；建边成环检测沿 predecessor → successor 方向走
+CREATE INDEX IF NOT EXISTS idx_dependencies_predecessor
+    ON reservation_dependencies (predecessor_id);
+CREATE INDEX IF NOT EXISTS idx_dependencies_successor
+    ON reservation_dependencies (successor_id);
 """
 
 _init_lock = threading.Lock()
@@ -142,6 +155,8 @@ def init_db(db_path: str | None = None) -> None:
       ``reservation_waitlist`` / ``reservation_waitlist_participants``
       均以 ``CREATE TABLE IF NOT EXISTS`` 无损建立：不改动任何既有
       预约/事件数据，建表幂等可重复执行。
+    - ``reservation_dependencies``（预约时序依赖表）同样以
+      ``CREATE TABLE IF NOT EXISTS`` 幂等无损建立，不影响任何既有数据。
     """
     path = db_path or get_db_path()
     with _init_lock:
